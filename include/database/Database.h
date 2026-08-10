@@ -17,6 +17,7 @@ namespace Configs {
         std::string name;
         int gid;
         int latency;
+        long long latency_at = 0;
         std::string dl_speed;
         std::string ul_speed;
         std::string test_country;
@@ -46,14 +47,17 @@ namespace Configs {
     // Run WAL checkpoint after this many write operations (exec or batch chunk).
     constexpr int WAL_CHECKPOINT_AFTER_WRITES = 10000;
 
-    // Reclaim free-list pages with a one-time VACUUM at startup when the file has
-    // accumulated significant dead space (SQLite never returns freed pages to the
-    // OS on its own without auto_vacuum). Both thresholds must be met, so we never
-    // VACUUM away trivial fragmentation on every launch:
-    //   - at least VACUUM_MIN_FREE_BYTES of free-list pages (absolute floor), and
-    //   - free pages make up at least VACUUM_MIN_FREE_RATIO of the whole file.
+    // How long a statement waits for a competing writer's lock before SQLITE_BUSY
+    // is raised. SQLiteCpp defaults to 0, i.e. transient contention fails instantly
+    // and surfaces as an exception.
+    constexpr int BUSY_TIMEOUT_MS = 5000;
+
+    // Both thresholds must be met; SQLite never returns freed pages to the OS on its own.
     constexpr long long VACUUM_MIN_FREE_BYTES = 4LL * 1024 * 1024; // 4 MiB
     constexpr double VACUUM_MIN_FREE_RATIO = 0.50;                 // 50%
+
+    constexpr int INCREMENTAL_VACUUM_PAGES = 1024;
+    constexpr unsigned long MAINTENANCE_DELAY_MS = 30000;
 
     inline void NotifyError(const std::string& query, std::exception& e) {
         runOnUiThread([=] {
@@ -68,8 +72,6 @@ namespace Configs {
         SQLite::Database db;
         std::atomic<int> writeCount{0};
         void maybeCheckpoint(int count);
-        // Run VACUUM once at startup if the free-list has grown large enough to be
-        // worth reclaiming (see VACUUM_MIN_* thresholds). No-op otherwise.
         void maybeVacuum();
 
         void execDeleteByIdInChunk(const std::string& table, const std::string& idColumn, const std::vector<int>& ids);
@@ -79,15 +81,18 @@ namespace Configs {
         void execBatchInsertProfilesChunk(const std::vector<ProfileInsertRow>& rows);
         void execBatchReplaceProfilesChunk(const std::vector<ProfileInsertRow>& rows);
     public:
-        Database(const std::string& path)
-            : db(path, SQLite::OPEN_READWRITE | SQLite::OPEN_CREATE) {
+        explicit Database(const std::string& path, bool incrementalVacuum = false)
+            : db(path, SQLite::OPEN_READWRITE | SQLite::OPEN_CREATE, BUSY_TIMEOUT_MS) {
+            // Must precede journal_mode: WAL writes the header, after which auto_vacuum no longer takes.
+            if (incrementalVacuum) db.exec("PRAGMA auto_vacuum = INCREMENTAL");
             db.exec("PRAGMA foreign_keys = ON");
             db.exec("PRAGMA journal_mode = WAL");
             db.exec("PRAGMA synchronous = NORMAL");
             db.exec("PRAGMA mmap_size = 67108864"); // 64MB
-            checkpointWal();
-            maybeVacuum();
         }
+
+        // Not safe from the constructor: a VACUUM there stalls startup.
+        void RunMaintenance();
 
     private:
 
@@ -176,9 +181,9 @@ namespace Configs {
             }
         }
 
-        // Chunked (12 params per row -> BATCH_LIMIT/12 rows per chunk)
+        // Chunked (13 params per row -> BATCH_LIMIT/13 rows per chunk)
         void execBatchInsertProfiles0(const std::vector<ProfileInsertRow>& rows) {
-            const size_t chunkSize = BATCH_LIMIT_WRITE / 12;
+            const size_t chunkSize = BATCH_LIMIT_WRITE / 13;
             for (size_t off = 0; off < rows.size(); off += chunkSize) {
                 size_t end = std::min(off + chunkSize, rows.size());
                 std::vector<ProfileInsertRow> chunk(rows.begin() + static_cast<std::ptrdiff_t>(off),
@@ -189,7 +194,7 @@ namespace Configs {
 
         // Same chunking as execBatchInsertProfiles; INSERT OR REPLACE for batch save/update
         void execBatchReplaceProfiles0(const std::vector<ProfileInsertRow>& rows) {
-            const size_t chunkSize = BATCH_LIMIT_WRITE / 12;
+            const size_t chunkSize = BATCH_LIMIT_WRITE / 13;
             for (size_t off = 0; off < rows.size(); off += chunkSize) {
                 size_t end = std::min(off + chunkSize, rows.size());
                 std::vector<ProfileInsertRow> chunk(rows.begin() + static_cast<std::ptrdiff_t>(off),

@@ -1,5 +1,8 @@
 #include <include/database/entities/Profile.h>
 
+#include <QJsonDocument>
+#include <QSet>
+
 #include "include/database/GroupsRepo.h"
 #include "include/global/Configs.hpp"
 
@@ -19,8 +22,16 @@ namespace Configs
         test_country.clear();
         ip_out.clear();
         latency = 0;
+        latency_at = 0;
         dl_speed.clear();
         ul_speed.clear();
+    }
+
+    void Profile::SetLatency(int ms) {
+        latency = ms;
+        // 0 means "never measured", so an explicit reset must clear the stamp
+        // rather than record the moment we forgot the result.
+        latency_at = ms == 0 ? 0 : QDateTime::currentSecsSinceEpoch();
     }
 
     QString Profile::DisplayTestResult() const {
@@ -72,6 +83,11 @@ namespace Configs
         QString ProfileFilter_ent_key(const std::shared_ptr<Configs::Profile> &ent, bool ignoreMetadata) {
         auto key = ent->outbound->ExportJsonLink(ignoreMetadata);
         return key;
+    }
+
+    QString ProfileFilter_ent_identity_key(const std::shared_ptr<Configs::Profile> &ent) {
+        auto obj = ent->outbound->ExportIdentity();
+        return ent->type + "|" + QString::fromUtf8(QJsonDocument(obj).toJson(QJsonDocument::Compact));
     }
 
     void ProfileFilter::Uniq(const QList<std::shared_ptr<Profile>> &in,
@@ -136,5 +152,36 @@ namespace Configs
         for (const auto &ent: src) {
             if (!dst.contains(ent)) out += ent;
         }
+    }
+
+    void ProfileFilter::ChangedByIdentity(QList<std::shared_ptr<Profile>> &src,
+                                          QList<std::shared_ptr<Profile>> &dst,
+                                          QList<std::shared_ptr<Profile>> &changedSrc,
+                                          QList<std::shared_ptr<Profile>> &changedDst) {
+        QMap<QString, QList<std::shared_ptr<Profile>>> srcByKey;
+        for (const auto &ent: src) {
+            srcByKey[ProfileFilter_ent_identity_key(ent)].append(ent);
+        }
+
+        QSet<Profile *> matchedSrc;
+        QList<std::shared_ptr<Profile>> remainingDst;
+        for (const auto &ent: dst) {
+            auto &bucket = srcByKey[ProfileFilter_ent_identity_key(ent)];
+            if (bucket.isEmpty()) {
+                remainingDst += ent;
+                continue;
+            }
+            auto srcEnt = bucket.takeFirst();
+            changedSrc += srcEnt;
+            changedDst += ent;
+            matchedSrc.insert(srcEnt.get());
+        }
+
+        QList<std::shared_ptr<Profile>> remainingSrc;
+        for (const auto &ent: src) {
+            if (!matchedSrc.contains(ent.get())) remainingSrc += ent;
+        }
+        src = remainingSrc;
+        dst = remainingDst;
     }
 }
